@@ -1,0 +1,7 @@
+{
+  "name": "Remix: Remix: Vintage: Conversational Analytics",
+  "description": "A premium, AI-powered business intelligence dashboard that turns natural language into interactive data visualizations using Gemini and SQLite.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
