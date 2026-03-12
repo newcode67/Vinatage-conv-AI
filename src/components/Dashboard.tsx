@@ -24,7 +24,8 @@ import {
   MicOff,
   ExternalLink,
   Clock,
-  ArrowRight
+  ArrowRight,
+  Loader2
 } from 'lucide-react';
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, 
@@ -37,11 +38,24 @@ import { twMerge } from 'tailwind-merge';
 import LandingPage from './LandingPage';
 import DataSourceManager from './DataSourceManager';
 
+import { 
+  generateStrategicSynthesis, 
+  generateFollowUpQuestions,
+  answerFollowUp,
+  generateSQL
+} from '../services/gemini';
+
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
 const COLORS = ['#ea580c', '#f97316', '#fb923c', '#fdba74', '#ffedd5', '#c2410c', '#9a3412'];
+
+interface FrequencyItem {
+  value: string | number;
+  count: number;
+  percentage: number;
+}
 
 interface SearchResult {
   query: string;
@@ -51,6 +65,7 @@ interface SearchResult {
   insight: string;
   summary: string;
   followUpQuestions: string[];
+  frequencyDistribution: Record<string, FrequencyItem[]>;
   chartConfig: {
     type: 'bar' | 'line' | 'pie' | 'area' | 'none';
     xKey: string;
@@ -67,6 +82,7 @@ export default function Dashboard() {
   const [activeDb, setActiveDb] = useState<string>('analytics.db');
   const [results, setResults] = useState<SearchResult[]>([]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [isDataSourceOpen, setIsDataSourceOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [history, setHistory] = useState<{ query: string, timestamp: number }[]>([]);
@@ -140,12 +156,99 @@ export default function Dashboard() {
   };
 
   const [selectedReport, setSelectedReport] = useState<SearchResult | null>(null);
+  const [followUpAnswer, setFollowUpAnswer] = useState<{ question: string, answer: string } | null>(null);
+  const [answeringFollowUp, setAnsweringFollowUp] = useState(false);
+
+  const calculateFrequencyDistribution = (data: any[]): Record<string, FrequencyItem[]> => {
+    if (!data || !Array.isArray(data) || data.length === 0) return {};
+    
+    const firstRow = data[0];
+    if (!firstRow) return {};
+    
+    const keys = Object.keys(firstRow);
+    const distribution: Record<string, FrequencyItem[]> = {};
+    
+    keys.forEach(key => {
+      const counts: Record<string, number> = {};
+      data.forEach(row => {
+        const val = row[key] === null || row[key] === undefined ? 'N/A' : String(row[key]);
+        counts[val] = (counts[val] || 0) + 1;
+      });
+      
+      const items: FrequencyItem[] = Object.entries(counts)
+        .map(([value, count]) => ({
+          value,
+          count,
+          percentage: (count / data.length) * 100
+        }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 50); // Keep more values for better distribution analysis
+        
+      distribution[key] = items;
+    });
+    
+    return distribution;
+  };
+
+  const handleFollowUpClick = async (question: string, result: SearchResult) => {
+    setAnsweringFollowUp(true);
+    setFollowUpAnswer(null);
+    try {
+      const answer = await answerFollowUp(result.data, question, result.table);
+      setFollowUpAnswer({ question, answer });
+    } catch (err) {
+      console.error("Follow-up error:", err);
+    } finally {
+      setAnsweringFollowUp(false);
+    }
+  };
+
+  const renderDataTable = (data: any[]) => {
+    if (!data || data.length === 0) return null;
+    const firstRow = data[0];
+    if (!firstRow) return null;
+    const headers = Object.keys(firstRow);
+    return (
+      <div className="overflow-x-auto rounded-2xl border border-white/10 bg-black/20">
+        <table className="w-full text-left border-collapse">
+          <thead>
+            <tr className="bg-white/5">
+              {headers.map(h => (
+                <th key={h} className="px-4 py-3 text-[10px] font-bold uppercase tracking-widest text-white/40 border-b border-white/10 whitespace-nowrap">
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {data.slice(0, 100).map((row, i) => (
+              <tr key={i} className="hover:bg-white/5 transition-colors">
+                {headers.map(h => (
+                  <td key={h} className="px-4 py-3 text-sm text-white/60 border-b border-white/5 whitespace-nowrap">
+                    {String(row[h])}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {data.length > 100 && (
+          <div className="p-4 text-center text-xs text-white/20 font-bold uppercase tracking-widest">
+            Showing first 100 of {data.length} records
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const generateDetailedReport = (result: SearchResult) => {
     const { data, table, chartConfig } = result;
-    if (data.length === 0) return "No data available for a detailed report.";
+    if (!data || data.length === 0) return "No data available for a detailed report.";
 
-    const keys = Object.keys(data[0]);
+    const firstRow = data[0];
+    if (!firstRow) return "No data available for a detailed report.";
+
+    const keys = Object.keys(firstRow);
     const numericKeys = keys.filter(k => typeof data[0][k] === 'number');
     const categoricalKeys = keys.filter(k => typeof data[0][k] === 'string');
 
@@ -202,80 +305,28 @@ export default function Dashboard() {
     return report;
   };
 
-  const generateFollowUpQuestions = (query: string, table: string, data: any[]) => {
-    const q = query.toLowerCase();
-    const questions: string[] = [];
-    const keys = data.length > 0 ? Object.keys(data[0]) : [];
-    const numericKeys = keys.filter(k => typeof data[0][k] === 'number');
-
-    if (q.includes('sales') || table.toLowerCase().includes('sales')) {
-      questions.push("Would you like me to identify the top-performing sales region?");
-      questions.push("Should I draft a summary of these sales tactics for your team?");
-      questions.push("Do you want to see a month-over-month growth comparison?");
-    } else if (q.includes('customer') || table.toLowerCase().includes('customer')) {
-      questions.push("Should I segment these customers by their lifetime value?");
-      questions.push("Would you like to see a list of customers who haven't ordered recently?");
-      questions.push("Do you want me to draft a personalized follow-up email template?");
-    } else if (q.includes('inventory') || table.toLowerCase().includes('inventory')) {
-      questions.push("Should I highlight items that are currently low in stock?");
-      questions.push("Would you like to see the total valuation of your current inventory?");
-      questions.push("Do you want me to suggest a reorder schedule based on this data?");
-    } else if (numericKeys.length > 0) {
-      questions.push(`Would you like to see a detailed breakdown of ${numericKeys[0]}?`);
-      questions.push("Should I look for anomalies or outliers in this dataset?");
-    }
-
-    // Generic fallbacks
-    if (questions.length < 3) {
-      questions.push("Would you like to export this data to a different format?");
-      questions.push("Should I compare this data with another table in your database?");
-    }
-
-    return questions.slice(0, 3);
-  };
-
-  const generateSummary = (data: any[], table: string) => {
-    if (data.length === 0) return "No data available to summarize.";
-    
-    const keys = Object.keys(data[0]);
-    const numericKeys = keys.filter(k => typeof data[0][k] === 'number');
-    const categoricalKeys = keys.filter(k => typeof data[0][k] === 'string');
-    
-    let summary = `Analysis of ${table}: `;
-    
-    if (numericKeys.length > 0) {
-      const primaryKey = numericKeys[0];
-      const values = data.map(d => d[primaryKey]).filter(v => typeof v === 'number');
-      const total = values.reduce((a, b) => a + b, 0);
-      const avg = total / values.length;
-      const max = Math.max(...values);
-      
-      summary += `The total ${primaryKey} is ${total.toLocaleString()}, with an average of ${avg.toLocaleString(undefined, {maximumFractionDigits: 2})}. The highest recorded value is ${max.toLocaleString()}. `;
-    }
-    
-    if (categoricalKeys.length > 0) {
-      const primaryCat = categoricalKeys[0];
-      const counts: Record<string, number> = {};
-      data.forEach(d => {
-        const val = d[primaryCat];
-        counts[val] = (counts[val] || 0) + 1;
-      });
-      const topCat = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
-      if (topCat) {
-        summary += `The most frequent ${primaryCat} is "${topCat[0]}" appearing ${topCat[1]} times. `;
-      }
-    }
-    
-    return summary;
-  };
-
   const getChartConfig = (data: any[]): SearchResult['chartConfig'] => {
-    if (data.length === 0) return { type: 'none', xKey: '', yKey: '' };
+    if (!data || data.length === 0) return { type: 'none', xKey: '', yKey: '' };
     
-    const keys = Object.keys(data[0]);
+    const firstRow = data[0];
+    if (!firstRow) return { type: 'none', xKey: '', yKey: '' };
+
+    const keys = Object.keys(firstRow);
     const numericKeys = keys.filter(k => typeof data[0][k] === 'number');
     const categoricalKeys = keys.filter(k => typeof data[0][k] === 'string');
     
+    // Prioritize line chart as requested
+    if (categoricalKeys.length > 0) {
+      const bestCatKey = categoricalKeys.find(k => {
+        const uniqueCount = new Set(data.map(d => d[k])).size;
+        return uniqueCount > 1 && uniqueCount <= 20;
+      }) || categoricalKeys[0];
+
+      // If we have numeric keys, we can plot them. If not, we plot counts.
+      const yKey = numericKeys.length > 0 ? numericKeys[0] : 'count';
+      return { type: 'line', xKey: bestCatKey, yKey };
+    }
+
     if (numericKeys.length === 0) return { type: 'none', xKey: '', yKey: '' };
     
     const yKey = numericKeys[0];
@@ -293,73 +344,118 @@ export default function Dashboard() {
       return { type: 'line', xKey: temporalKey, yKey };
     }
     
-    // If few categories, use pie
-    const uniqueVals = new Set(data.map(d => d[xKey])).size;
-    if (uniqueVals <= 7 && uniqueVals > 1) {
-      return { type: 'pie', xKey, yKey };
-    }
-    
     return { type: 'bar', xKey, yKey };
   };
 
   const renderChart = (data: any[], config: SearchResult['chartConfig']) => {
     if (config.type === 'none') return null;
 
+    let chartData: any[] = [];
+    let yKeyToUse = config.yKey;
+    const numericKeys = Object.keys(data[0] || {}).filter(k => typeof data[0][k] === 'number');
+
+    if (config.yKey === 'count') {
+      const counts: Record<string, number> = {};
+      data.forEach(item => {
+        const val = String(item[config.xKey] || 'N/A');
+        counts[val] = (counts[val] || 0) + 1;
+      });
+
+      chartData = Object.entries(counts)
+        .map(([name, count]) => ({
+          [config.xKey]: name,
+          count,
+          percentage: (count / data.length) * 100
+        }))
+        .sort((a, b) => String(a[config.xKey]).localeCompare(String(b[config.xKey]), undefined, { numeric: true }))
+        .slice(0, 12);
+      
+      yKeyToUse = 'count';
+    } else {
+      const aggregatedDataMap: Record<string, any> = {};
+      data.forEach(item => {
+        const xVal = String(item[config.xKey]);
+        if (!aggregatedDataMap[xVal]) {
+          aggregatedDataMap[xVal] = { [config.xKey]: xVal };
+          numericKeys.forEach(k => aggregatedDataMap[xVal][k] = 0);
+        }
+        numericKeys.forEach(k => {
+          aggregatedDataMap[xVal][k] += Number(item[k]) || 0;
+        });
+      });
+
+      chartData = Object.values(aggregatedDataMap)
+        .sort((a, b) => String(a[config.xKey]).localeCompare(String(b[config.xKey]), undefined, { numeric: true }))
+        .slice(0, 15);
+    }
+
+    const infographicColors = ['#facc15', '#f97316', '#0d9488', '#6366f1', '#ec4899'];
+
     return (
-      <ResponsiveContainer width="100%" height={350}>
-        {config.type === 'bar' ? (
-          <BarChart data={data}>
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-            <XAxis dataKey={config.xKey} stroke="rgba(255,255,255,0.3)" fontSize={10} tickLine={false} axisLine={false} tick={{ dy: 10 }} />
-            <YAxis stroke="rgba(255,255,255,0.3)" fontSize={10} tickLine={false} axisLine={false} tick={{ dx: -10 }} />
-            <Tooltip 
-              contentStyle={{ backgroundColor: 'rgba(0,0,0,0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '16px', color: '#fff', backdropFilter: 'blur(10px)' }}
-              itemStyle={{ color: '#ea580c' }}
-              cursor={{ fill: 'rgba(255,255,255,0.05)' }}
+      <div className="flex flex-col gap-8">
+        <ResponsiveContainer width="100%" height={400}>
+          <LineChart data={chartData} margin={{ top: 40, right: 30, left: 20, bottom: 20 }}>
+            <CartesianGrid strokeDasharray="0" stroke="rgba(255,255,255,0.1)" vertical={true} horizontal={true} />
+            <XAxis 
+              dataKey={config.xKey} 
+              stroke="rgba(255,255,255,0.4)" 
+              fontSize={11} 
+              tickLine={false} 
+              axisLine={false} 
+              orientation="top"
+              dy={-10}
+              fontWeight="bold"
             />
-            <Bar dataKey={config.yKey} fill="#ea580c" radius={[6, 6, 0, 0]} barSize={40} />
-          </BarChart>
-        ) : config.type === 'line' ? (
-          <LineChart data={data}>
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-            <XAxis dataKey={config.xKey} stroke="rgba(255,255,255,0.3)" fontSize={10} tickLine={false} axisLine={false} tick={{ dy: 10 }} />
-            <YAxis stroke="rgba(255,255,255,0.3)" fontSize={10} tickLine={false} axisLine={false} tick={{ dx: -10 }} />
-            <Tooltip contentStyle={{ backgroundColor: 'rgba(0,0,0,0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '16px', color: '#fff', backdropFilter: 'blur(10px)' }} />
-            <Line type="monotone" dataKey={config.yKey} stroke="#ea580c" strokeWidth={4} dot={{ r: 6, fill: '#ea580c', strokeWidth: 0 }} activeDot={{ r: 8, stroke: '#fff', strokeWidth: 2 }} />
+            <YAxis hide={true} />
+            <Tooltip 
+              contentStyle={{ backgroundColor: 'rgba(0,0,0,0.95)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px', color: '#fff', backdropFilter: 'blur(10px)' }}
+              itemStyle={{ fontSize: '12px' }}
+              cursor={{ stroke: 'rgba(255,255,255,0.1)', strokeWidth: 2 }}
+            />
+            {yKeyToUse === 'count' ? (
+              <Line 
+                type="linear" 
+                dataKey="count" 
+                stroke={infographicColors[0]} 
+                strokeWidth={3} 
+                dot={{ r: 5, fill: infographicColors[0], strokeWidth: 2, stroke: '#000' }} 
+                activeDot={{ r: 7, stroke: '#fff', strokeWidth: 2 }} 
+              />
+            ) : (
+              numericKeys.slice(0, 3).map((key, index) => (
+                <Line 
+                  key={key}
+                  type="linear" 
+                  dataKey={key} 
+                  stroke={infographicColors[index % infographicColors.length]} 
+                  strokeWidth={3} 
+                  dot={{ r: 5, fill: infographicColors[index % infographicColors.length], strokeWidth: 2, stroke: '#000' }} 
+                  activeDot={{ r: 7, stroke: '#fff', strokeWidth: 2 }} 
+                />
+              ))
+            )}
           </LineChart>
-        ) : config.type === 'pie' ? (
-          <PieChart>
-            <Pie 
-              data={data} 
-              cx="50%" 
-              cy="50%" 
-              innerRadius={70} 
-              outerRadius={100} 
-              paddingAngle={8} 
-              dataKey={config.yKey} 
-              nameKey={config.xKey}
-              stroke="none"
-            >
-              {data.map((_: any, index: number) => <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />)}
-            </Pie>
-            <Tooltip contentStyle={{ backgroundColor: 'rgba(0,0,0,0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '16px', color: '#fff', backdropFilter: 'blur(10px)' }} />
-          </PieChart>
-        ) : (
-          <AreaChart data={data}>
-            <defs>
-              <linearGradient id="colorArea" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="#ea580c" stopOpacity={0.6}/>
-                <stop offset="95%" stopColor="#ea580c" stopOpacity={0}/>
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-            <XAxis dataKey={config.xKey} stroke="rgba(255,255,255,0.3)" fontSize={10} tickLine={false} axisLine={false} tick={{ dy: 10 }} />
-            <YAxis stroke="rgba(255,255,255,0.3)" fontSize={10} tickLine={false} axisLine={false} tick={{ dx: -10 }} />
-            <Tooltip contentStyle={{ backgroundColor: 'rgba(0,0,0,0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '16px', color: '#fff', backdropFilter: 'blur(10px)' }} />
-            <Area type="monotone" dataKey={config.yKey} stroke="#ea580c" strokeWidth={3} fillOpacity={1} fill="url(#colorArea)" />
-          </AreaChart>
-        )}
-      </ResponsiveContainer>
+        </ResponsiveContainer>
+
+        {/* Infographic Legend Section */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-8 pt-10 border-t border-white/10">
+          {chartData.slice(0, 4).map((item, idx) => (
+            <div key={idx} className="group flex flex-col gap-4 p-6 rounded-[2rem] bg-white/[0.02] border border-white/5 hover:bg-white/[0.05] transition-all duration-500">
+              <div className="text-4xl font-black tracking-tighter leading-none" style={{ color: infographicColors[idx % infographicColors.length] }}>
+                {typeof item[config.xKey] === 'number' ? Number(item[config.xKey]).toFixed(1) : String(item[config.xKey])}
+              </div>
+              <div className="flex flex-col gap-1">
+                <div className="text-[10px] text-white/40 uppercase tracking-[0.2em] font-bold leading-tight">
+                  {yKeyToUse === 'count' 
+                    ? `${item.count} occurrences detected in dataset`
+                    : `Primary metric value: ${Number(item[config.yKey]).toLocaleString()}`
+                  }
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
     );
   };
 
@@ -378,30 +474,12 @@ export default function Dashboard() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
     
     try {
-      // Simple Keyword-based Search Logic
-      const q = activeQuery.toLowerCase();
-      let targetTable = '';
+      // Use Gemini to generate a smart SQL query based on the user's natural language
+      const sql = await generateSQL(activeQuery, schema);
       
-      // Find matching table from schema
-      const tables = Object.keys(schema);
-      for (const table of tables) {
-        if (q.includes(table.toLowerCase())) {
-          targetTable = table;
-          break;
-        }
+      if (!sql) {
+        throw new Error("Could not generate a valid query for your request.");
       }
-
-      // Fallback to first table if no match
-      if (!targetTable && tables.length > 0) {
-        targetTable = tables[0];
-      }
-
-      if (!targetTable) {
-        throw new Error("No data tables found in the active database.");
-      }
-
-      // Generate simple SQL
-      const sql = `SELECT * FROM "${targetTable}" LIMIT 50`;
 
       const res = await fetch('/api/query', {
         method: 'POST',
@@ -412,15 +490,32 @@ export default function Dashboard() {
       const queryResult = await res.json();
       if (queryResult.error) throw new Error(queryResult.error);
 
-      const data = queryResult.results;
+      const data = queryResult.results || [];
+      
+      if (!Array.isArray(data)) {
+        throw new Error("Invalid data format received from server.");
+      }
+
+      // Determine target table from SQL for the insight message
+      let targetTable = 'data';
+      const tableMatch = sql.match(/FROM\s+"?([^"\s]+)"?/i);
+      if (tableMatch) targetTable = tableMatch[1];
+      
+      // Use Gemini for Strategic Synthesis and Follow-up Questions
+      const [geminiSynthesis, geminiFollowUps] = await Promise.all([
+        generateStrategicSynthesis(data, activeQuery, targetTable),
+        generateFollowUpQuestions(data, activeQuery, targetTable)
+      ]);
+
       const newResult: SearchResult = {
         query: activeQuery,
         data,
         table: targetTable,
         timestamp: Date.now(),
         insight: `Found ${data.length} records in ${targetTable} matching your search.`,
-        summary: generateSummary(data, targetTable),
-        followUpQuestions: generateFollowUpQuestions(activeQuery, targetTable, data),
+        summary: geminiSynthesis,
+        followUpQuestions: geminiFollowUps,
+        frequencyDistribution: calculateFrequencyDistribution(data),
         chartConfig: getChartConfig(data)
       };
       
@@ -480,6 +575,20 @@ export default function Dashboard() {
           </div>
           
           <div className="flex items-center gap-4">
+            <button 
+              onClick={() => setIsHistoryOpen(true)}
+              className="p-2.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-all group"
+              title="History"
+            >
+              <History className="w-4 h-4 group-hover:text-orange-500 transition-colors" />
+            </button>
+            <button 
+              onClick={() => setIsDataSourceOpen(true)}
+              className="p-2.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-all group"
+              title="Data Sources"
+            >
+              <Database className="w-4 h-4 group-hover:text-orange-500 transition-colors" />
+            </button>
             <button 
               onClick={() => fileInputRef.current?.click()}
               className="flex items-center gap-3 px-6 py-2.5 text-sm font-bold bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl transition-all led-glow-orange/0 hover:led-glow-orange/20"
@@ -656,16 +765,70 @@ export default function Dashboard() {
                         </p>
                       </div>
 
+                      {/* Data Explorer Table */}
+                      <div className="mb-10 p-8 bg-black/40 rounded-[2.5rem] border border-white/10 overflow-hidden shadow-[0_0_50px_rgba(234,88,12,0.1)] hover:shadow-[0_0_70px_rgba(234,88,12,0.15)] transition-all duration-700 group/table">
+                        <div className="flex items-center justify-between mb-6">
+                          <div className="flex items-center gap-2 text-orange-500 font-bold text-[11px] uppercase tracking-[0.2em]">
+                            <TableIcon className="w-4 h-4" />
+                            Data Explorer
+                          </div>
+                          <div className="text-[10px] text-white/40 font-bold uppercase tracking-widest">
+                            Showing {Math.min(result.data.length, 50)} of {result.data.length} records
+                          </div>
+                        </div>
+                        <div className="overflow-x-auto custom-scrollbar max-h-[500px] overflow-y-auto">
+                          <table className="w-full text-left text-sm border-separate border-spacing-0">
+                            <thead className="sticky top-0 z-20 bg-[#0a0a0a]">
+                              <tr>
+                                {result.data.length > 0 && Object.keys(result.data[0]).map((key) => (
+                                  <th key={key} className="pb-4 px-4 font-bold text-white/40 uppercase tracking-wider border-b border-white/10 whitespace-nowrap">
+                                    {key}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-white/5">
+                              {result.data.slice(0, 50).map((row, rIdx) => (
+                                <tr key={rIdx} className="group/row hover:bg-orange-500/5 transition-colors">
+                                  {Object.values(row).map((val: any, cIdx) => (
+                                    <td key={cIdx} className="py-4 px-4 text-white/70 group-hover/row:text-white transition-colors whitespace-nowrap border-b border-white/5">
+                                      {val === null || val === undefined ? (
+                                        <span className="opacity-20 italic">null</span>
+                                      ) : typeof val === 'boolean' ? (
+                                        <span className={val ? 'text-emerald-500' : 'text-rose-500'}>{val.toString()}</span>
+                                      ) : val.toString()}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        {result.data.length > 50 && (
+                          <div className="mt-6 text-center text-white/20 text-[10px] font-bold uppercase tracking-widest">
+                            + {result.data.length - 50} more records
+                          </div>
+                        )}
+                      </div>
+
                       {/* Chart Section */}
                       {result.chartConfig.type !== 'none' && (
-                        <div className="mb-10 p-8 bg-black/40 rounded-[2.5rem] border border-white/10 shadow-inner">
-                          <div className="flex items-center justify-between mb-6">
-                            <div className="flex items-center gap-2 text-white/40 font-bold text-[10px] uppercase tracking-widest">
-                              <TrendingUp className="w-3 h-3 text-orange-500" />
-                              {result.chartConfig.type} Visualization
+                        <div className="mb-10 p-10 bg-black/40 rounded-[3rem] border border-white/10 shadow-[0_0_50px_rgba(234,88,12,0.05)] hover:shadow-[0_0_70px_rgba(234,88,12,0.1)] transition-all duration-700">
+                          <div className="flex items-center justify-between mb-10">
+                            <div className="flex flex-col gap-1">
+                              <div className="flex items-center gap-2 text-orange-500 font-bold text-[11px] uppercase tracking-[0.2em]">
+                                <TrendingUp className="w-4 h-4" />
+                                Line Chart Infographics
+                              </div>
+                              <h4 className="text-3xl font-black text-white tracking-tighter">
+                                Strategic Data Synthesis
+                              </h4>
+                            </div>
+                            <div className="px-6 py-3 bg-white/5 border border-white/10 rounded-2xl text-[10px] text-white/60 font-bold uppercase tracking-[0.3em]">
+                              {result.chartConfig.xKey} Analysis
                             </div>
                           </div>
-                          <div className="h-[350px]">
+                          <div className="w-full">
                             {renderChart(result.data, result.chartConfig)}
                           </div>
                         </div>
@@ -682,7 +845,7 @@ export default function Dashboard() {
                         {result.followUpQuestions.map((q, i) => (
                           <button
                             key={i}
-                            onClick={() => handleSearch(undefined, q)}
+                            onClick={() => handleFollowUpClick(q, result)}
                             className="text-left px-6 py-5 bg-white/5 hover:bg-orange-500/10 border border-white/10 hover:border-orange-500/40 rounded-2xl text-base text-white/60 hover:text-white transition-all group flex items-center justify-between led-glow-orange/0 hover:led-glow-orange/20"
                           >
                             <span className="line-clamp-2 font-medium">{q}</span>
@@ -690,6 +853,41 @@ export default function Dashboard() {
                           </button>
                         ))}
                       </div>
+
+                      {/* Follow-up Answer Section */}
+                      <AnimatePresence>
+                        {(answeringFollowUp || followUpAnswer) && (
+                          <motion.div 
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: 'auto' }}
+                            exit={{ opacity: 0, height: 0 }}
+                            className="mt-8 p-8 bg-blue-500/5 border border-blue-500/20 rounded-[2.5rem] relative overflow-hidden"
+                          >
+                            {answeringFollowUp ? (
+                              <div className="flex items-center gap-3 text-blue-400">
+                                <Loader2 className="w-5 h-5 animate-spin" />
+                                <span className="text-sm font-bold uppercase tracking-widest">Synthesizing Answer...</span>
+                              </div>
+                            ) : followUpAnswer && (
+                              <div className="space-y-4">
+                                <div className="flex items-center gap-2 text-blue-400 font-bold text-[11px] uppercase tracking-[0.2em]">
+                                  <Sparkles className="w-4 h-4" />
+                                  AI Insight: {followUpAnswer.question}
+                                </div>
+                                <p className="text-lg text-white/90 leading-relaxed">
+                                  {followUpAnswer.answer}
+                                </p>
+                                <button 
+                                  onClick={() => setFollowUpAnswer(null)}
+                                  className="text-xs text-white/40 hover:text-white transition-colors"
+                                >
+                                  Dismiss
+                                </button>
+                              </div>
+                            )}
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </div>
                   </div>
 
@@ -807,6 +1005,15 @@ export default function Dashboard() {
                       })}
                     </div>
                   </div>
+
+                  {/* Raw Data Table */}
+                  <div className="space-y-4">
+                    <div className="flex items-center gap-2 text-white/40 font-bold text-[10px] uppercase tracking-widest">
+                      <TableIcon className="w-3 h-3" />
+                      Raw Data Records
+                    </div>
+                    {renderDataTable(selectedReport.data)}
+                  </div>
                 </div>
               </div>
 
@@ -917,22 +1124,55 @@ export default function Dashboard() {
         )}
       </AnimatePresence>
 
+      {/* Data Source Modal */}
+      <AnimatePresence>
+        {isDataSourceOpen && (
+          <div className="fixed inset-0 z-[130] flex items-center justify-center p-6">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsDataSourceOpen(false)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-4xl max-h-[90vh] bg-[#0a0a0a] border border-white/10 rounded-[2.5rem] shadow-2xl overflow-hidden flex flex-col z-10"
+            >
+              <div className="p-8 border-b border-white/10 flex items-center justify-between bg-white/5">
+                <div className="flex items-center gap-3">
+                  <div className="p-3 bg-orange-600 rounded-2xl">
+                    <Database className="w-6 h-6 text-white" />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-bold">Data Source Manager</h2>
+                    <p className="text-xs font-bold uppercase tracking-widest text-white/40">Manage your connected datasets</p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setIsDataSourceOpen(false)}
+                  className="p-3 hover:bg-white/10 rounded-2xl transition-all"
+                >
+                  <LogOut className="w-6 h-6 rotate-180" />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
+                <DataSourceManager 
+                  onSourceChange={() => {
+                    fetchSchema();
+                    setIsDataSourceOpen(false);
+                  }} 
+                  activeSource={activeDb} 
+                />
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Sidebar - Hidden by default, accessible via floating button if needed */}
-      <div className="fixed bottom-8 right-8 flex flex-col gap-4">
-        <button 
-          onClick={() => setIsHistoryOpen(true)}
-          className="w-14 h-14 bg-white/10 hover:bg-white/20 backdrop-blur-xl rounded-2xl flex items-center justify-center border border-white/10 shadow-2xl transition-all group"
-          title="History"
-        >
-          <History className="w-6 h-6 group-hover:text-orange-500 transition-colors" />
-        </button>
-        <button 
-          className="w-14 h-14 bg-orange-600 hover:bg-orange-500 rounded-2xl flex items-center justify-center shadow-2xl shadow-orange-600/20 transition-all"
-          title="Data Sources"
-        >
-          <Database className="w-6 h-6" />
-        </button>
-      </div>
     </div>
   );
 }
