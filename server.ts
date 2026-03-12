@@ -7,9 +7,9 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DATA_DIR = path.join(__dirname, "data");
+const DATA_DIR = path.join(process.cwd(), "data");
 if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR);
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
 let currentDbName = "analytics.db";
@@ -22,6 +22,7 @@ function initDb(database: any) {
       product TEXT,
       category TEXT,
       amount REAL,
+      price REAL,
       region TEXT,
       date TEXT
     );
@@ -64,18 +65,18 @@ function initDb(database: any) {
   const rowCount = database.prepare("SELECT COUNT(*) as count FROM sales").get() as { count: number };
   if (rowCount.count === 0) {
     // Sales
-    const insertSale = database.prepare("INSERT INTO sales (product, category, amount, region, date) VALUES (?, ?, ?, ?, ?)");
+    const insertSale = database.prepare("INSERT INTO sales (product, category, amount, price, region, date) VALUES (?, ?, ?, ?, ?, ?)");
     const salesData = [
-      ['Enterprise Server', 'Hardware', 5000, 'North', '2024-02-01'],
-      ['Cloud Subscription', 'Software', 1200, 'Global', '2024-02-02'],
-      ['Consulting Service', 'Services', 3000, 'West', '2024-02-03'],
-      ['Workstation Pro', 'Hardware', 2500, 'East', '2024-02-04'],
-      ['Security Suite', 'Software', 800, 'South', '2024-02-05'],
-      ['Network Switch', 'Hardware', 1500, 'North', '2024-02-06'],
-      ['CRM License', 'Software', 450, 'Global', '2024-02-07'],
-      ['Training Workshop', 'Services', 2000, 'West', '2024-02-08'],
-      ['Backup Drive', 'Hardware', 300, 'East', '2024-02-09'],
-      ['Analytics Tool', 'Software', 950, 'South', '2024-02-10'],
+      ['Enterprise Server', 'Hardware', 5000, 2500, 'North', '2024-02-01'],
+      ['Cloud Subscription', 'Software', 1200, 100, 'Global', '2024-02-02'],
+      ['Consulting Service', 'Services', 3000, 150, 'West', '2024-02-03'],
+      ['Workstation Pro', 'Hardware', 2500, 1250, 'East', '2024-02-04'],
+      ['Security Suite', 'Software', 800, 400, 'South', '2024-02-05'],
+      ['Network Switch', 'Hardware', 1500, 750, 'North', '2024-02-06'],
+      ['CRM License', 'Software', 450, 45, 'Global', '2024-02-07'],
+      ['Training Workshop', 'Services', 2000, 500, 'West', '2024-02-08'],
+      ['Backup Drive', 'Hardware', 300, 150, 'East', '2024-02-09'],
+      ['Analytics Tool', 'Software', 950, 475, 'South', '2024-02-10'],
     ];
     for (const sale of salesData) insertSale.run(...sale);
 
@@ -133,6 +134,12 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json({ limit: '50mb' }));
+
+  // Request logging middleware
+  app.use((req, res, next) => {
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+    next();
+  });
 
   // API: List Data Sources
   app.get("/api/datasources", (req, res) => {
@@ -290,11 +297,27 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(__dirname, "dist")));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(__dirname, "dist", "index.html"));
-    });
+    const distPath = path.join(process.cwd(), "dist");
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+      app.get("*", (req, res) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    } else {
+      app.get("*", (req, res) => {
+        res.status(404).send("Production build not found. Please run npm run build.");
+      });
+    }
   }
+
+  // Global error handler
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error("Unhandled Error:", err);
+    res.status(err.status || 500).json({ 
+      error: err.message || "Internal Server Error",
+      stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+    });
+  });
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);

@@ -6,6 +6,7 @@ import {
   LineChart as LineChartIcon, 
   Table as TableIcon, 
   Upload, 
+  FileText,
   Database, 
   Sparkles, 
   AlertCircle,
@@ -28,22 +29,56 @@ import {
   Loader2
 } from 'lucide-react';
 import { 
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, 
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, 
   LineChart, Line, PieChart, Pie, Cell, AreaChart, Area 
 } from 'recharts';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  Title,
+  Tooltip as ChartJSTooltip,
+  Legend,
+  PointElement,
+  LineElement,
+  ArcElement
+} from 'chart.js';
+import { Bar as ChartJSBar, Line as ChartJSLine, Pie as ChartJSPie } from 'react-chartjs-2';
+
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  Title,
+  ChartJSTooltip,
+  Legend,
+  PointElement,
+  LineElement,
+  ArcElement
+);
 import { motion, AnimatePresence } from 'motion/react';
 import Papa from 'papaparse';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import LandingPage from './LandingPage';
 import DataSourceManager from './DataSourceManager';
+import FileUploader from './FileUploader';
 
 import { 
   generateStrategicSynthesis, 
   generateFollowUpQuestions,
   answerFollowUp,
-  generateSQL
+  generateSQL,
+  generateChartConfig,
+  chatWithData,
+  classifyIntent,
+  handleGeneralConversation,
+  generateGlobalAnalysis,
+  generateInitialAnalysis,
+  generateAutoGraphJSON
 } from '../services/gemini';
+import ReactMarkdown from 'react-markdown';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -83,8 +118,17 @@ export default function Dashboard() {
   const [results, setResults] = useState<SearchResult[]>([]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isDataSourceOpen, setIsDataSourceOpen] = useState(false);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'bot', text: string }[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatLoading, setIsChatLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [globalAnalysis, setGlobalAnalysis] = useState<string | null>(null);
+  const [isAnalyzingGlobal, setIsAnalyzingGlobal] = useState(false);
+  const [mode, setMode] = useState<'bi' | 'autograph' | 'file'>('bi');
+  const [autoGraphData, setAutoGraphData] = useState<any>(null);
+  const [fileData, setFileData] = useState<{ data: any[], name: string } | null>(null);
   const [history, setHistory] = useState<{ query: string, timestamp: number }[]>([]);
   const [isListening, setIsListening] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -305,48 +349,6 @@ export default function Dashboard() {
     return report;
   };
 
-  const getChartConfig = (data: any[]): SearchResult['chartConfig'] => {
-    if (!data || data.length === 0) return { type: 'none', xKey: '', yKey: '' };
-    
-    const firstRow = data[0];
-    if (!firstRow) return { type: 'none', xKey: '', yKey: '' };
-
-    const keys = Object.keys(firstRow);
-    const numericKeys = keys.filter(k => typeof data[0][k] === 'number');
-    const categoricalKeys = keys.filter(k => typeof data[0][k] === 'string');
-    
-    // Prioritize line chart as requested
-    if (categoricalKeys.length > 0) {
-      const bestCatKey = categoricalKeys.find(k => {
-        const uniqueCount = new Set(data.map(d => d[k])).size;
-        return uniqueCount > 1 && uniqueCount <= 20;
-      }) || categoricalKeys[0];
-
-      // If we have numeric keys, we can plot them. If not, we plot counts.
-      const yKey = numericKeys.length > 0 ? numericKeys[0] : 'count';
-      return { type: 'line', xKey: bestCatKey, yKey };
-    }
-
-    if (numericKeys.length === 0) return { type: 'none', xKey: '', yKey: '' };
-    
-    const yKey = numericKeys[0];
-    let xKey = categoricalKeys[0] || keys[0];
-    
-    // Check for temporal data
-    const temporalKey = categoricalKeys.find(k => 
-      k.toLowerCase().includes('date') || 
-      k.toLowerCase().includes('time') || 
-      k.toLowerCase().includes('month') || 
-      k.toLowerCase().includes('year')
-    );
-    
-    if (temporalKey) {
-      return { type: 'line', xKey: temporalKey, yKey };
-    }
-    
-    return { type: 'bar', xKey, yKey };
-  };
-
   const renderChart = (data: any[], config: SearchResult['chartConfig']) => {
     if (config.type === 'none') return null;
 
@@ -367,8 +369,8 @@ export default function Dashboard() {
           count,
           percentage: (count / data.length) * 100
         }))
-        .sort((a, b) => String(a[config.xKey]).localeCompare(String(b[config.xKey]), undefined, { numeric: true }))
-        .slice(0, 12);
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 10);
       
       yKeyToUse = 'count';
     } else {
@@ -385,56 +387,82 @@ export default function Dashboard() {
       });
 
       chartData = Object.values(aggregatedDataMap)
-        .sort((a, b) => String(a[config.xKey]).localeCompare(String(b[config.xKey]), undefined, { numeric: true }))
-        .slice(0, 15);
+        .filter(item => !isNaN(Number(item[config.yKey])))
+        .sort((a, b) => (Number(b[config.yKey]) || 0) - (Number(a[config.yKey]) || 0))
+        .slice(0, 12);
     }
 
     const infographicColors = ['#facc15', '#f97316', '#0d9488', '#6366f1', '#ec4899'];
 
+    const renderChartComponent = () => {
+      switch (config.type) {
+        case 'bar':
+          return (
+            <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+              <XAxis dataKey={config.xKey} stroke="rgba(255,255,255,0.4)" fontSize={10} tickLine={false} axisLine={false} />
+              <YAxis stroke="rgba(255,255,255,0.4)" fontSize={10} tickLine={false} axisLine={false} />
+              <RechartsTooltip 
+                contentStyle={{ backgroundColor: 'rgba(0,0,0,0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px' }}
+                cursor={{ fill: 'rgba(255,255,255,0.05)' }}
+              />
+              <Bar dataKey={yKeyToUse} fill={infographicColors[1]} radius={[4, 4, 0, 0]} />
+            </BarChart>
+          );
+        case 'area':
+          return (
+            <AreaChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
+              <defs>
+                <linearGradient id="colorY" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={infographicColors[1]} stopOpacity={0.3}/>
+                  <stop offset="95%" stopColor={infographicColors[1]} stopOpacity={0}/>
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+              <XAxis dataKey={config.xKey} stroke="rgba(255,255,255,0.4)" fontSize={10} tickLine={false} axisLine={false} />
+              <YAxis stroke="rgba(255,255,255,0.4)" fontSize={10} tickLine={false} axisLine={false} />
+              <RechartsTooltip contentStyle={{ backgroundColor: 'rgba(0,0,0,0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px' }} />
+              <Area type="monotone" dataKey={yKeyToUse} stroke={infographicColors[1]} fillOpacity={1} fill="url(#colorY)" />
+            </AreaChart>
+          );
+        case 'pie':
+          return (
+            <PieChart>
+              <Pie
+                data={chartData}
+                cx="50%"
+                cy="50%"
+                innerRadius={60}
+                outerRadius={100}
+                paddingAngle={5}
+                dataKey={yKeyToUse}
+                nameKey={config.xKey}
+              >
+                {chartData.map((entry, index) => (
+                  <Cell key={`cell-${index}`} fill={infographicColors[index % infographicColors.length]} />
+                ))}
+              </Pie>
+              <RechartsTooltip contentStyle={{ backgroundColor: 'rgba(0,0,0,0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px' }} />
+            </PieChart>
+          );
+        case 'line':
+        default:
+          return (
+            <LineChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+              <XAxis dataKey={config.xKey} stroke="rgba(255,255,255,0.4)" fontSize={10} tickLine={false} axisLine={false} />
+              <YAxis stroke="rgba(255,255,255,0.4)" fontSize={10} tickLine={false} axisLine={false} />
+              <RechartsTooltip contentStyle={{ backgroundColor: 'rgba(0,0,0,0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px' }} />
+              <Line type="monotone" dataKey={yKeyToUse} stroke={infographicColors[1]} strokeWidth={3} dot={{ r: 4, fill: infographicColors[1] }} />
+            </LineChart>
+          );
+      }
+    };
+
     return (
       <div className="flex flex-col gap-8">
         <ResponsiveContainer width="100%" height={400}>
-          <LineChart data={chartData} margin={{ top: 40, right: 30, left: 20, bottom: 20 }}>
-            <CartesianGrid strokeDasharray="0" stroke="rgba(255,255,255,0.1)" vertical={true} horizontal={true} />
-            <XAxis 
-              dataKey={config.xKey} 
-              stroke="rgba(255,255,255,0.4)" 
-              fontSize={11} 
-              tickLine={false} 
-              axisLine={false} 
-              orientation="top"
-              dy={-10}
-              fontWeight="bold"
-            />
-            <YAxis hide={true} />
-            <Tooltip 
-              contentStyle={{ backgroundColor: 'rgba(0,0,0,0.95)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px', color: '#fff', backdropFilter: 'blur(10px)' }}
-              itemStyle={{ fontSize: '12px' }}
-              cursor={{ stroke: 'rgba(255,255,255,0.1)', strokeWidth: 2 }}
-            />
-            {yKeyToUse === 'count' ? (
-              <Line 
-                type="linear" 
-                dataKey="count" 
-                stroke={infographicColors[0]} 
-                strokeWidth={3} 
-                dot={{ r: 5, fill: infographicColors[0], strokeWidth: 2, stroke: '#000' }} 
-                activeDot={{ r: 7, stroke: '#fff', strokeWidth: 2 }} 
-              />
-            ) : (
-              numericKeys.slice(0, 3).map((key, index) => (
-                <Line 
-                  key={key}
-                  type="linear" 
-                  dataKey={key} 
-                  stroke={infographicColors[index % infographicColors.length]} 
-                  strokeWidth={3} 
-                  dot={{ r: 5, fill: infographicColors[index % infographicColors.length], strokeWidth: 2, stroke: '#000' }} 
-                  activeDot={{ r: 7, stroke: '#fff', strokeWidth: 2 }} 
-                />
-              ))
-            )}
-          </LineChart>
+          {renderChartComponent()}
         </ResponsiveContainer>
 
         {/* Infographic Legend Section */}
@@ -459,6 +487,19 @@ export default function Dashboard() {
     );
   };
 
+  const handleGlobalAnalysis = async () => {
+    if (Object.keys(schema).length === 0) return;
+    setIsAnalyzingGlobal(true);
+    try {
+      const analysis = await generateGlobalAnalysis(schema);
+      setGlobalAnalysis(analysis);
+    } catch (err) {
+      console.error("Global Analysis Error:", err);
+    } finally {
+      setIsAnalyzingGlobal(false);
+    }
+  };
+
   const handleSearch = async (e?: React.FormEvent, customQuery?: string) => {
     if (e) e.preventDefault();
     
@@ -474,7 +515,117 @@ export default function Dashboard() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
     
     try {
-      // Use Gemini to generate a smart SQL query based on the user's natural language
+      // 1. Classify Intent
+      if (mode === 'autograph') {
+        const rawJson = await generateAutoGraphJSON(activeQuery);
+        try {
+          const parsed = JSON.parse(rawJson);
+          if (parsed.greeting) {
+            setError(parsed.greeting);
+            setLoading(false);
+            return;
+          }
+
+          // Clean data: ensure numeric and filter out NaN
+          if (parsed.labels && (parsed.datasets?.[0]?.data || parsed.data)) {
+            const dataToUse = parsed.datasets?.[0]?.data || parsed.data;
+            const zipped = parsed.labels.map((l: string, i: number) => ({ 
+              label: l, 
+              value: Number(dataToUse[i]) 
+            })).filter((item: any) => !isNaN(item.value));
+            
+            parsed.labels = zipped.map((item: any) => item.label);
+            if (parsed.datasets?.[0]) {
+              parsed.datasets[0].data = zipped.map((item: any) => item.value);
+            } else {
+              parsed.data = zipped.map((item: any) => item.value);
+            }
+          }
+
+          setAutoGraphData(parsed);
+          setLoading(false);
+          return;
+        } catch (e) {
+          console.error("Auto-Graph Parse Error:", e, rawJson);
+          setError("I couldn't generate a valid graph from that input. Try being more specific with your data!");
+          setLoading(false);
+          return;
+        }
+      }
+
+      const intent = await classifyIntent(activeQuery);
+      
+      if (intent === "GENERAL_CONVERSATION") {
+        const greetingResponse = await handleGeneralConversation(activeQuery);
+        const greetingResult: SearchResult = {
+          query: activeQuery,
+          data: [],
+          table: 'Gemini',
+          timestamp: Date.now(),
+          insight: greetingResponse,
+          summary: "I'm here to help you explore your business data. Ask me about sales, inventory, or customers!",
+          followUpQuestions: ["Show me sales overview", "Who are our top customers?", "What's in inventory?"],
+          frequencyDistribution: {},
+          chartConfig: { type: 'none', xKey: '', yKey: '' }
+        };
+        setResults([greetingResult]);
+        setLoading(false);
+        return;
+      }
+
+      if (intent === "DIRECT_DATA") {
+        const rawJson = await generateAutoGraphJSON(activeQuery);
+        
+        let directData: any[] = [];
+        let directChartConfig: SearchResult['chartConfig'] = { type: 'none', xKey: '', yKey: '' };
+        let summary = "Direct Data Visualization";
+
+        try {
+          const parsed = JSON.parse(rawJson);
+          if (parsed.greeting) {
+            setError(parsed.greeting);
+            setLoading(false);
+            return;
+          }
+          directChartConfig = {
+            type: parsed.type || 'bar',
+            xKey: 'label',
+            yKey: 'value'
+          };
+          
+          // Handle new datasets structure or fallback to old data structure
+          if (parsed.datasets && parsed.datasets[0]) {
+            directData = parsed.labels.map((label: string, i: number) => ({
+              label,
+              value: Number(parsed.datasets[0].data[i])
+            }));
+          } else if (parsed.data) {
+            directData = parsed.labels.map((label: string, i: number) => ({
+              label,
+              value: Number(parsed.data[i])
+            }));
+          }
+        } catch (e) {
+          console.error("Failed to parse direct chart JSON", e);
+        }
+
+        const directResult: SearchResult = {
+          query: activeQuery,
+          data: directData,
+          table: 'Direct Input',
+          timestamp: Date.now(),
+          insight: "Direct Data Visualization",
+          summary: summary,
+          followUpQuestions: ["Add more data", "Change chart type", "Analyze these values"],
+          frequencyDistribution: {},
+          chartConfig: directChartConfig
+        };
+        setResults([directResult]);
+        setLoading(false);
+        return;
+      }
+
+      // 2. Data Query Logic
       const sql = await generateSQL(activeQuery, schema);
       
       if (!sql) {
@@ -486,6 +637,13 @@ export default function Dashboard() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sql })
       });
+
+      const contentType = res.headers.get("content-type");
+      if (!res.ok || !contentType || !contentType.includes("application/json")) {
+        const text = await res.text();
+        console.error("API Error Response:", text);
+        throw new Error(`Server responded with ${res.status} (${contentType}): ${text.slice(0, 100)}...`);
+      }
 
       const queryResult = await res.json();
       if (queryResult.error) throw new Error(queryResult.error);
@@ -501,10 +659,15 @@ export default function Dashboard() {
       const tableMatch = sql.match(/FROM\s+"?([^"\s]+)"?/i);
       if (tableMatch) targetTable = tableMatch[1];
       
-      // Use Gemini for Strategic Synthesis and Follow-up Questions
-      const [geminiSynthesis, geminiFollowUps] = await Promise.all([
-        generateStrategicSynthesis(data, activeQuery, targetTable),
-        generateFollowUpQuestions(data, activeQuery, targetTable)
+      // Use Gemini for Strategic Synthesis, Follow-up Questions, and Chart Configuration
+      const isInitialSearch = activeQuery.toLowerCase().startsWith("search in ");
+      
+      const [geminiSynthesis, geminiFollowUps, geminiChartConfig] = await Promise.all([
+        isInitialSearch 
+          ? generateInitialAnalysis(data, targetTable)
+          : generateStrategicSynthesis(data, activeQuery, targetTable),
+        generateFollowUpQuestions(data, activeQuery, targetTable),
+        generateChartConfig(data, activeQuery)
       ]);
 
       const newResult: SearchResult = {
@@ -516,7 +679,7 @@ export default function Dashboard() {
         summary: geminiSynthesis,
         followUpQuestions: geminiFollowUps,
         frequencyDistribution: calculateFrequencyDistribution(data),
-        chartConfig: getChartConfig(data)
+        chartConfig: geminiChartConfig
       };
       
       const newResults = [newResult];
@@ -530,7 +693,13 @@ export default function Dashboard() {
       if (!customQuery) setQuery('');
     } catch (err) {
       console.error("Search Error:", err);
-      setError(`Search Error: ${(err as Error).message}`);
+      const errorMessage = (err as Error).message;
+      
+      if (errorMessage.includes("no such table") || errorMessage.includes("Could not generate a valid query")) {
+        setError(`I acknowledge your request for data, but I'm having trouble finding that specific information in the current database. Would you like to try searching for something else like 'sales' or 'customers'?`);
+      } else {
+        setError("I'm having a bit of trouble accessing my data right now, but I can still chat with you! How can I help otherwise?");
+      }
     } finally {
       setLoading(false);
     }
@@ -558,7 +727,105 @@ export default function Dashboard() {
         <div className="absolute top-[20%] right-[10%] w-[20%] h-[20%] bg-purple-600/5 blur-[100px] rounded-full" />
       </div>
 
-      {/* Header */}
+      {/* Chatbot Floating Button */}
+      <div className="fixed bottom-8 right-8 z-[100]">
+        <AnimatePresence>
+          {isChatOpen && (
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="absolute bottom-20 right-0 w-[400px] h-[600px] bg-black/80 backdrop-blur-3xl border border-white/10 rounded-[2.5rem] shadow-2xl flex flex-col overflow-hidden"
+            >
+              <div className="p-6 border-b border-white/10 flex items-center justify-between bg-orange-600/10">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 bg-orange-600 rounded-lg flex items-center justify-center">
+                    <Sparkles className="w-5 h-5 text-white" />
+                  </div>
+                  <h3 className="font-bold text-white">Data Assistant</h3>
+                </div>
+                <button onClick={() => setIsChatOpen(false)} className="text-white/40 hover:text-white">
+                  <ChevronDown className="w-6 h-6" />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar">
+                {chatMessages.length === 0 && (
+                  <div className="text-center py-10 opacity-40">
+                    <Sparkles className="w-12 h-12 mx-auto mb-4" />
+                    <p>Ask me anything about the current data results!</p>
+                  </div>
+                )}
+                {chatMessages.map((msg, i) => (
+                  <div key={i} className={cn(
+                    "max-w-[85%] p-4 rounded-2xl text-sm leading-relaxed",
+                    msg.role === 'user' 
+                      ? "ml-auto bg-orange-600 text-white" 
+                      : "mr-auto bg-white/5 text-white/80 border border-white/10"
+                  )}>
+                    {msg.text}
+                  </div>
+                ))}
+                {isChatLoading && (
+                  <div className="mr-auto bg-white/5 text-white/40 p-4 rounded-2xl text-sm animate-pulse">
+                    Thinking...
+                  </div>
+                )}
+              </div>
+
+              <form 
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  if (!chatInput.trim() || isChatLoading || results.length === 0) return;
+                  
+                  const userMsg = chatInput;
+                  setChatInput('');
+                  setChatMessages(prev => [...prev, { role: 'user', text: userMsg }]);
+                  setIsChatLoading(true);
+                  
+                  try {
+                    const botResponse = await chatWithData(results[0].data, userMsg);
+                    setChatMessages(prev => [...prev, { role: 'bot', text: botResponse }]);
+                  } catch (err) {
+                    setChatMessages(prev => [...prev, { role: 'bot', text: "I'm sorry, I encountered an error." }]);
+                  } finally {
+                    setIsChatLoading(false);
+                  }
+                }}
+                className="p-4 border-t border-white/10 bg-white/5"
+              >
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    placeholder={results.length === 0 ? "Perform a search first..." : "Type your question..."}
+                    disabled={results.length === 0}
+                    className="w-full bg-black/40 border border-white/10 rounded-xl py-3 pl-4 pr-12 text-sm focus:outline-none focus:border-orange-500 transition-all"
+                  />
+                  <button 
+                    type="submit"
+                    disabled={!chatInput.trim() || isChatLoading || results.length === 0}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-orange-500 hover:text-orange-400 disabled:opacity-20"
+                  >
+                    <ArrowRight className="w-5 h-5" />
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <button
+          onClick={() => setIsChatOpen(!isChatOpen)}
+          className={cn(
+            "w-16 h-16 rounded-full flex items-center justify-center shadow-2xl transition-all duration-500 group",
+            isChatOpen ? "bg-white text-black rotate-90" : "bg-orange-600 text-white hover:scale-110"
+          )}
+        >
+          {isChatOpen ? <ChevronDown className="w-8 h-8" /> : <Sparkles className="w-8 h-8 group-hover:animate-pulse" />}
+        </button>
+      </div>
       <header className="bg-black/40 backdrop-blur-2xl sticky top-0 z-50 border-b border-white/5">
         <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -590,6 +857,14 @@ export default function Dashboard() {
               <Database className="w-4 h-4 group-hover:text-orange-500 transition-colors" />
             </button>
             <button 
+              onClick={handleGlobalAnalysis}
+              disabled={isAnalyzingGlobal || Object.keys(schema).length === 0}
+              className="flex items-center gap-3 px-6 py-2.5 text-sm font-bold bg-orange-600/10 hover:bg-orange-600/20 border border-orange-600/20 rounded-2xl transition-all text-orange-500 disabled:opacity-50"
+            >
+              <Sparkles className={cn("w-4 h-4", isAnalyzingGlobal && "animate-spin")} />
+              {isAnalyzingGlobal ? 'Analyzing...' : 'AI Strategy'}
+            </button>
+            <button 
               onClick={() => fileInputRef.current?.click()}
               className="flex items-center gap-3 px-6 py-2.5 text-sm font-bold bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl transition-all led-glow-orange/0 hover:led-glow-orange/20"
             >
@@ -616,8 +891,8 @@ export default function Dashboard() {
                      if (uploadResult.error) throw new Error(uploadResult.error);
                      
                      await fetchSchema();
-                     handleSearch(undefined, `Search in ${tableName}`);
-                   } catch (err) {
+                      handleSearch(undefined, `Search in ${tableName}`);
+                    } catch (err) {
                      alert("Upload failed: " + (err as Error).message);
                    } finally { setUploading(false); }
                  }
@@ -633,12 +908,247 @@ export default function Dashboard() {
         </div>
       </header>
 
+      {/* Mode Toggle */}
+      <div className="fixed top-24 left-1/2 -translate-x-1/2 z-40 flex bg-white/5 backdrop-blur-xl border border-white/10 p-1 rounded-2xl">
+        <button 
+          onClick={() => { setMode('bi'); setAutoGraphData(null); setResults([]); setFileData(null); }}
+          className={cn(
+            "px-6 py-2 rounded-xl text-sm font-bold transition-all",
+            mode === 'bi' ? "bg-orange-600 text-white shadow-lg shadow-orange-600/20" : "text-white/40 hover:text-white"
+          )}
+        >
+          Business Intelligence
+        </button>
+        <button 
+          onClick={() => { setMode('autograph'); setResults([]); setAutoGraphData(null); setFileData(null); }}
+          className={cn(
+            "px-6 py-2 rounded-xl text-sm font-bold transition-all",
+            mode === 'autograph' ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" : "text-white/40 hover:text-white"
+          )}
+        >
+          Auto-Grapher
+        </button>
+        <button 
+          onClick={() => { setMode('file'); setResults([]); setAutoGraphData(null); setFileData(null); }}
+          className={cn(
+            "px-6 py-2 rounded-xl text-sm font-bold transition-all",
+            mode === 'file' ? "bg-emerald-600 text-white shadow-lg shadow-emerald-600/20" : "text-white/40 hover:text-white"
+          )}
+        >
+          File Explorer
+        </button>
+      </div>
+
       <main className="max-w-4xl mx-auto px-6 py-12 relative z-10">
+        {/* File Upload Section */}
+        {mode === 'file' && !fileData && (
+          <div className="py-20">
+            <div className="text-center mb-12">
+              <h2 className="text-4xl font-black text-white tracking-tighter mb-4">Upload Your Intelligence</h2>
+              <p className="text-white/40 text-lg font-medium">Drop any CSV, Excel, or TXT file to generate multi-dimensional visualizations</p>
+            </div>
+            <FileUploader onDataLoaded={(data, name) => setFileData({ data, name })} />
+          </div>
+        )}
+
+        {/* File Data Multi-Chart Display */}
+        {mode === 'file' && fileData && (
+          <motion.div 
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="space-y-12"
+          >
+            <div className="flex items-center justify-between bg-white/5 border border-white/10 p-8 rounded-[2.5rem] backdrop-blur-xl">
+              <div>
+                <div className="flex items-center gap-2 text-emerald-500 font-bold text-[11px] uppercase tracking-[0.2em] mb-2">
+                  <FileText className="w-4 h-4" />
+                  Active Dataset
+                </div>
+                <h3 className="text-3xl font-black text-white tracking-tighter">{fileData.name}</h3>
+              </div>
+              <button 
+                onClick={() => setFileData(null)}
+                className="px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-xs font-bold text-white transition-all"
+              >
+                Upload New
+              </button>
+            </div>
+
+            {/* 3 Different Charts */}
+            <div className="grid grid-cols-1 gap-12">
+              {/* Chart 1: Bar Chart */}
+              <div className="p-10 bg-black/40 rounded-[3rem] border border-white/10">
+                <div className="flex items-center gap-2 text-orange-500 font-bold text-[11px] uppercase tracking-[0.2em] mb-8">
+                  <BarChart3 className="w-4 h-4" />
+                  Distribution Analysis (Bar)
+                </div>
+                <div className="h-[400px]">
+                  {renderChart(fileData.data, { 
+                    type: 'bar', 
+                    xKey: Object.keys(fileData.data[0])[0], 
+                    yKey: 'count' 
+                  })}
+                </div>
+              </div>
+
+              {/* Chart 2: Line Chart */}
+              <div className="p-10 bg-black/40 rounded-[3rem] border border-white/10">
+                <div className="flex items-center gap-2 text-blue-500 font-bold text-[11px] uppercase tracking-[0.2em] mb-8">
+                  <LineChartIcon className="w-4 h-4" />
+                  Trend Visualization (Line)
+                </div>
+                <div className="h-[400px]">
+                  {renderChart(fileData.data, { 
+                    type: 'line', 
+                    xKey: Object.keys(fileData.data[0])[0], 
+                    yKey: Object.keys(fileData.data[0]).find(k => typeof fileData.data[0][k] === 'number') || 'count'
+                  })}
+                </div>
+              </div>
+
+              {/* Chart 3: Pie Chart */}
+              <div className="p-10 bg-black/40 rounded-[3rem] border border-white/10">
+                <div className="flex items-center gap-2 text-pink-500 font-bold text-[11px] uppercase tracking-[0.2em] mb-8">
+                  <PieChartIcon className="w-4 h-4" />
+                  Composition Breakdown (Pie)
+                </div>
+                <div className="h-[400px]">
+                  {renderChart(fileData.data, { 
+                    type: 'pie', 
+                    xKey: Object.keys(fileData.data[0])[0], 
+                    yKey: 'count' 
+                  })}
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+        {/* Global Analysis Section */}
+        <AnimatePresence>
+          {globalAnalysis && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="mb-12 p-8 rounded-[2.5rem] bg-orange-600/5 border border-orange-600/20 relative overflow-hidden"
+            >
+              <div className="absolute top-0 right-0 p-6">
+                <button onClick={() => setGlobalAnalysis(null)} className="text-white/20 hover:text-white">
+                  <ChevronDown className="w-6 h-6 rotate-180" />
+                </button>
+              </div>
+              <div className="flex items-center gap-3 mb-6">
+                <div className="w-10 h-10 bg-orange-600 rounded-xl flex items-center justify-center">
+                  <Sparkles className="w-6 h-6 text-white" />
+                </div>
+                <h2 className="text-xl font-bold text-orange-500 uppercase tracking-widest">Global Data Strategy</h2>
+              </div>
+              <div className="prose prose-invert max-w-none text-white/70 leading-relaxed">
+                <ReactMarkdown>{globalAnalysis}</ReactMarkdown>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Auto-Grapher Display */}
+        {mode === 'autograph' && autoGraphData && (
+          <motion.div 
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mb-12 bg-white/5 border border-white/10 rounded-3xl p-8 backdrop-blur-xl"
+          >
+            <h3 className="text-xl font-bold mb-6 text-blue-400">
+              {autoGraphData.datasets?.[0]?.label || autoGraphData.label || 'Generated Chart'}
+            </h3>
+            <div className="h-[400px]">
+              {autoGraphData.type === 'bar' && (
+                <ChartJSBar 
+                  data={{
+                    labels: autoGraphData.labels,
+                    datasets: autoGraphData.datasets || [{
+                      label: autoGraphData.label,
+                      data: autoGraphData.data,
+                      backgroundColor: 'rgba(66, 133, 244, 0.5)',
+                      borderColor: '#4285F4',
+                      borderWidth: 1
+                    }]
+                  }}
+                  options={{ 
+                    responsive: true, 
+                    maintainAspectRatio: false, 
+                    scales: { 
+                      y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: 'rgba(255,255,255,0.5)' } },
+                      x: { grid: { display: false }, ticks: { color: 'rgba(255,255,255,0.5)' } }
+                    },
+                    plugins: {
+                      legend: { labels: { color: 'rgba(255,255,255,0.7)' } }
+                    }
+                  }}
+                />
+              )}
+              {autoGraphData.type === 'line' && (
+                <ChartJSLine 
+                  data={{
+                    labels: autoGraphData.labels,
+                    datasets: autoGraphData.datasets || [{
+                      label: autoGraphData.label,
+                      data: autoGraphData.data,
+                      backgroundColor: 'rgba(66, 133, 244, 0.5)',
+                      borderColor: '#4285F4',
+                      borderWidth: 2,
+                      tension: 0.4,
+                      fill: true
+                    }]
+                  }}
+                  options={{ 
+                    responsive: true, 
+                    maintainAspectRatio: false, 
+                    scales: { 
+                      y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: 'rgba(255,255,255,0.5)' } },
+                      x: { grid: { display: false }, ticks: { color: 'rgba(255,255,255,0.5)' } }
+                    },
+                    plugins: {
+                      legend: { labels: { color: 'rgba(255,255,255,0.7)' } }
+                    }
+                  }}
+                />
+              )}
+              {autoGraphData.type === 'pie' && (
+                <ChartJSPie 
+                  data={{
+                    labels: autoGraphData.labels,
+                    datasets: autoGraphData.datasets || [{
+                      label: autoGraphData.label,
+                      data: autoGraphData.data,
+                      backgroundColor: [
+                        'rgba(66, 133, 244, 0.5)',
+                        'rgba(219, 68, 55, 0.5)',
+                        'rgba(244, 180, 0, 0.5)',
+                        'rgba(15, 157, 88, 0.5)',
+                        'rgba(171, 71, 188, 0.5)',
+                      ],
+                      borderColor: '#fff',
+                      borderWidth: 1
+                    }]
+                  }}
+                  options={{ 
+                    responsive: true, 
+                    maintainAspectRatio: false,
+                    plugins: {
+                      legend: { labels: { color: 'rgba(255,255,255,0.7)' } }
+                    }
+                  }}
+                />
+              )}
+            </div>
+          </motion.div>
+        )}
+
         {/* Search Bar - Center Focused */}
         <div className="mb-16">
           <form onSubmit={handleSearch} className="relative group neon-border rounded-[2.5rem]">
             <div className="absolute left-6 top-1/2 -translate-y-1/2 text-white/40 group-focus-within:text-orange-500 transition-colors z-20">
-              <Search className="w-6 h-6" />
+              <Sparkles className="w-6 h-6" />
             </div>
             <input
               type="text"
@@ -653,7 +1163,7 @@ export default function Dashboard() {
               onChange={(e) => setQuery(e.target.value)}
               placeholder={isListening ? "Listening..." : "Ask anything about your business data..."}
               className={cn(
-                "w-full bg-black/60 border border-white/10 rounded-[2.5rem] py-8 pl-16 pr-44 text-2xl font-medium placeholder:text-white/20 focus:outline-none focus:ring-2 focus:ring-orange-600/30 focus:border-orange-600/50 backdrop-blur-3xl transition-all shadow-2xl led-glow-orange relative z-10",
+                "w-full bg-black/60 border border-white/10 rounded-[2.5rem] py-8 pl-16 pr-56 text-2xl font-medium placeholder:text-white/20 focus:outline-none focus:ring-2 focus:ring-orange-600/30 focus:border-orange-600/50 backdrop-blur-3xl transition-all shadow-2xl led-glow-orange relative z-10",
                 isListening && "ring-4 ring-red-500/20 border-red-500/50 led-glow-blue"
               )}
             />
@@ -678,7 +1188,7 @@ export default function Dashboard() {
                 ) : (
                   <>
                     Analyze
-                    <ArrowRight className="w-6 h-6 group-hover:translate-x-1 transition-transform" />
+                    <Sparkles className="w-6 h-6 group-hover:rotate-12 transition-transform" />
                   </>
                 )}
               </button>
@@ -817,11 +1327,14 @@ export default function Dashboard() {
                           <div className="flex items-center justify-between mb-10">
                             <div className="flex flex-col gap-1">
                               <div className="flex items-center gap-2 text-orange-500 font-bold text-[11px] uppercase tracking-[0.2em]">
-                                <TrendingUp className="w-4 h-4" />
-                                Line Chart Infographics
+                                {result.chartConfig.type === 'bar' && <BarChart3 className="w-4 h-4" />}
+                                {result.chartConfig.type === 'line' && <LineChartIcon className="w-4 h-4" />}
+                                {result.chartConfig.type === 'pie' && <PieChartIcon className="w-4 h-4" />}
+                                {result.chartConfig.type === 'area' && <TrendingUp className="w-4 h-4" />}
+                                {result.chartConfig.type.toUpperCase()} CHART INFOGRAPHICS
                               </div>
                               <h4 className="text-3xl font-black text-white tracking-tighter">
-                                Strategic Data Synthesis
+                                Visual Intelligence Report
                               </h4>
                             </div>
                             <div className="px-6 py-3 bg-white/5 border border-white/10 rounded-2xl text-[10px] text-white/60 font-bold uppercase tracking-[0.3em]">
