@@ -1,4 +1,5 @@
 # Vintage AI - Conversational Business Intelligence
+https://vinatage-conv-ai7.vercel.app/
 
 Vintage AI is a full-stack application that turns your data into decisions through natural language. Upload CSV files, ask questions, and get instant insights with automatic visualizations.
 
